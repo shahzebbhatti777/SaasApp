@@ -6,6 +6,8 @@ const passport = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const crypto = require('crypto');
 const { authenticateToken } = require('./auth');
+const speakeasy = require('speakeasy');
+const QRCode = require('qrcode');
 
 const router = express.Router();
 const prisma = new PrismaClient();
@@ -20,6 +22,14 @@ function createAccessToken(user) {
   return jwt.sign({ id: user.id, email: user.email }, process.env.JWT_SECRET, {
     expiresIn: ACCESS_TOKEN_EXPIRES_IN,
   });
+}
+
+async function issueTokens(user, req) {
+  const sessionContext = getClientContext(req);
+  const accessToken = createAccessToken(user);
+  const { token: refreshToken } = await createRefreshToken(user.id, sessionContext);
+
+  return { accessToken, refreshToken };
 }
 
 function getClientContext(req) {
@@ -192,9 +202,7 @@ router.post('/register', async (req, res) => {
       },
     });
 
-    const sessionContext = getClientContext(req);
-    const accessToken = createAccessToken(user);
-    const { token: refreshToken } = await createRefreshToken(user.id, sessionContext);
+    const { accessToken, refreshToken } = await issueTokens(user, req);
 
     return res.status(201).json({
       accessToken,
@@ -231,9 +239,11 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    const sessionContext = getClientContext(req);
-    const accessToken = createAccessToken(user);
-    const { token: refreshToken } = await createRefreshToken(user.id, sessionContext);
+    if (user.mfaEnabled) {
+      return res.status(403).json({ error: 'MFA required', mfaRequired: true });
+    }
+
+    const { accessToken, refreshToken } = await issueTokens(user, req);
 
     return res.json({
       accessToken,
@@ -246,6 +256,58 @@ router.post('/login', async (req, res) => {
     });
   } catch (error) {
     console.error('Login error:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.post('/mfa/login', async (req, res) => {
+  const { email, password, token } = req.body || {};
+
+  if (!email || !password || !token || !EMAIL_REGEX.test(email)) {
+    return res.status(400).json({ error: 'Invalid or missing fields' });
+  }
+
+  try {
+    const user = await prisma.user.findUnique({ where: { email } });
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    if (!user.mfaEnabled || !user.mfaSecret) {
+      return res.status(400).json({ error: 'MFA is not enabled for this account' });
+    }
+
+    const passwordMatch = await bcrypt.compare(password, user.password);
+
+    if (!passwordMatch) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const verified = speakeasy.totp.verify({
+      secret: user.mfaSecret,
+      encoding: 'base32',
+      token,
+      window: 1,
+    });
+
+    if (!verified) {
+      return res.status(401).json({ error: 'Invalid MFA token' });
+    }
+
+    const { accessToken, refreshToken } = await issueTokens(user, req);
+
+    return res.json({
+      accessToken,
+      refreshToken,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+      },
+    });
+  } catch (error) {
+    console.error('MFA login error:', error);
     return res.status(500).json({ error: 'Server error' });
   }
 });
@@ -334,6 +396,63 @@ router.post('/logout', authenticateToken, async (req, res) => {
   }
 
   return res.json({ message: 'Logged out successfully.' });
+});
+
+router.post('/mfa/setup', authenticateToken, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const secret = speakeasy.generateSecret({ name: `MARQ OS (${user.email})` });
+    const qrCodeUrl = await QRCode.toDataURL(secret.otpauth_url);
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { mfaSecret: secret.base32, mfaEnabled: false },
+    });
+
+    return res.json({ qrCodeUrl, manualCode: secret.base32 });
+  } catch (error) {
+    console.error('MFA setup error:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.post('/mfa/verify', authenticateToken, async (req, res) => {
+  const { token } = req.body || {};
+
+  if (!token) {
+    return res.status(400).json({ error: 'Token is required' });
+  }
+
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+
+    if (!user || !user.mfaSecret) {
+      return res.status(400).json({ error: 'MFA setup has not been initiated' });
+    }
+
+    const verified = speakeasy.totp.verify({
+      secret: user.mfaSecret,
+      encoding: 'base32',
+      token,
+      window: 1,
+    });
+
+    if (!verified) {
+      return res.status(400).json({ error: 'Invalid token' });
+    }
+
+    await prisma.user.update({ where: { id: user.id }, data: { mfaEnabled: true } });
+
+    return res.json({ message: 'MFA enabled successfully' });
+  } catch (error) {
+    console.error('MFA verify error:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
 });
 
 router.get('/me', authenticateToken, async (req, res) => {
