@@ -2,6 +2,7 @@ const express = require('express');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { PrismaClient } = require('@prisma/client');
+const { authenticateToken } = require('./auth');
 
 const router = express.Router();
 const prisma = new PrismaClient();
@@ -88,6 +89,25 @@ router.post('/login', async (req, res) => {
     });
   } catch (error) {
     console.error('Login error:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.get('/me', authenticateToken, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    return res.json({
+      id: user.id,
+      email: user.email,
+      name: user.name,
+    });
+  } catch (error) {
+    console.error('Profile fetch error:', error);
     return res.status(500).json({ error: 'Server error' });
   }
 });
