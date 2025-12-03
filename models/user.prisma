@@ -12,6 +12,7 @@ model User {
   email     String   @unique
   password  String
   name      String
+  emailVerified Boolean @default(false)
   mfaEnabled Boolean  @default(false)
   mfaSecret  String?
   createdAt DateTime @default(now())
@@ -19,6 +20,7 @@ model User {
   resets    PasswordReset[]
   refreshes RefreshToken[]
   sessions  SessionLog[]
+  emailVerifications EmailVerificationToken[]
 }
 
 model PasswordReset {
@@ -52,4 +54,13 @@ model SessionLog {
   createdAt    DateTime @default(now())
   expiresAt    DateTime
   revoked      Boolean  @default(false)
+}
+
+model EmailVerificationToken {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  expiresAt DateTime
+  createdAt DateTime @default(now())
 }

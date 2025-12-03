@@ -8,6 +8,7 @@ const crypto = require('crypto');
 const { authenticateToken } = require('./auth');
 const speakeasy = require('speakeasy');
 const QRCode = require('qrcode');
+const nodemailer = require('nodemailer');
 
 const router = express.Router();
 const prisma = new PrismaClient();
@@ -15,6 +16,7 @@ const prisma = new PrismaClient();
 const frontendBaseUrl = (process.env.FRONTEND_URL || 'https://yourfrontend.com').replace(/\/$/, '');
 const ACCESS_TOKEN_EXPIRES_IN = '15m';
 const REFRESH_TOKEN_EXPIRES_IN_MS = 7 * 24 * 60 * 60 * 1000;
+const EMAIL_TOKEN_EXPIRES_IN_MS = 60 * 60 * 1000;
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -114,6 +116,60 @@ async function revokeSessionByRefreshToken(token) {
   }
 }
 
+function createEmailTransporter() {
+  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS } = process.env;
+
+  if (!SMTP_HOST || !SMTP_PORT || !SMTP_USER || !SMTP_PASS) {
+    console.warn('Email transport is not fully configured. Verification emails will not be sent.');
+    return null;
+  }
+
+  return nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: Number(SMTP_PORT) || 587,
+    secure: false,
+    auth: {
+      user: SMTP_USER,
+      pass: SMTP_PASS,
+    },
+  });
+}
+
+async function createEmailVerificationToken(userId) {
+  const tokenValue = crypto.randomBytes(32).toString('hex');
+  const expiresAt = new Date(Date.now() + EMAIL_TOKEN_EXPIRES_IN_MS);
+
+  await prisma.emailVerificationToken.deleteMany({ where: { userId } });
+
+  await prisma.emailVerificationToken.create({
+    data: {
+      token: tokenValue,
+      userId,
+      expiresAt,
+    },
+  });
+
+  return { token: tokenValue, expiresAt };
+}
+
+async function sendVerificationEmail(email, token) {
+  const transporter = createEmailTransporter();
+
+  if (!transporter) {
+    throw new Error('Email transport not configured');
+  }
+
+  const verifyUrl = `${frontendBaseUrl}/verify-email?token=${encodeURIComponent(token)}`;
+
+  await transporter.sendMail({
+    from: process.env.EMAIL_FROM || 'no-reply@marqos.local',
+    to: email,
+    subject: 'Verify your email address',
+    text: `Welcome to MARQ OS! Please verify your email by visiting: ${verifyUrl}\n\nIf you did not request this, you can ignore this email.`,
+    html: `<p>Welcome to MARQ OS!</p><p>Please verify your email by clicking the link below:</p><p><a href="${verifyUrl}">${verifyUrl}</a></p><p>If you did not request this, you can ignore this email.</p>`,
+  });
+}
+
 async function revokeSessionById(sessionId, userId) {
   try {
     const session = await prisma.sessionLog.findUnique({ where: { id: sessionId } });
@@ -161,7 +217,13 @@ passport.use(
               email,
               name: nameFromProfile,
               password: '',
+              emailVerified: true,
             },
+          });
+        } else if (!user.emailVerified) {
+          user = await prisma.user.update({
+            where: { id: user.id },
+            data: { emailVerified: true },
           });
         }
 
@@ -199,22 +261,52 @@ router.post('/register', async (req, res) => {
         email,
         password: hashedPassword,
         name,
+        emailVerified: false,
       },
     });
 
-    const { accessToken, refreshToken } = await issueTokens(user, req);
+    const { token } = await createEmailVerificationToken(user.id);
+    await sendVerificationEmail(user.email, token);
 
     return res.status(201).json({
-      accessToken,
-      refreshToken,
+      message: 'Registration successful. Please verify your email to continue.',
       user: {
         id: user.id,
         email: user.email,
         name: user.name,
+        emailVerified: user.emailVerified,
       },
     });
   } catch (error) {
     console.error('Registration error:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.post('/send-verification-email', async (req, res) => {
+  const { email } = req.body || {};
+
+  if (!email || !EMAIL_REGEX.test(email)) {
+    return res.status(400).json({ error: 'Valid email is required' });
+  }
+
+  try {
+    const user = await prisma.user.findUnique({ where: { email } });
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    if (user.emailVerified) {
+      return res.status(400).json({ error: 'Email is already verified' });
+    }
+
+    const { token } = await createEmailVerificationToken(user.id);
+    await sendVerificationEmail(user.email, token);
+
+    return res.json({ message: 'Verification email sent' });
+  } catch (error) {
+    console.error('Send verification email error:', error);
     return res.status(500).json({ error: 'Server error' });
   }
 });
@@ -237,6 +329,10 @@ router.post('/login', async (req, res) => {
 
     if (!passwordMatch) {
       return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    if (!user.emailVerified) {
+      return res.status(403).json({ error: 'Email not verified' });
     }
 
     if (user.mfaEnabled) {
@@ -282,6 +378,10 @@ router.post('/mfa/login', async (req, res) => {
 
     if (!passwordMatch) {
       return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    if (!user.emailVerified) {
+      return res.status(403).json({ error: 'Email not verified' });
     }
 
     const verified = speakeasy.totp.verify({
@@ -372,6 +472,10 @@ router.post('/refresh', async (req, res) => {
       return res.status(401).json({ error: 'Invalid refresh token' });
     }
 
+    if (!user.emailVerified) {
+      return res.status(403).json({ error: 'Email not verified' });
+    }
+
     const sessionContext = getClientContext(req);
 
     await revokeRefreshToken(refreshToken);
@@ -384,6 +488,35 @@ router.post('/refresh', async (req, res) => {
   } catch (error) {
     console.error('Refresh token error:', error);
     return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.get('/verify-email', async (req, res) => {
+  const { token } = req.query;
+
+  if (!token) {
+    return res.status(400).send('Verification token is required.');
+  }
+
+  try {
+    const record = await prisma.emailVerificationToken.findUnique({ where: { token } });
+
+    if (!record) {
+      return res.status(400).send('Invalid or expired verification link.');
+    }
+
+    if (record.expiresAt <= new Date()) {
+      await prisma.emailVerificationToken.delete({ where: { id: record.id } });
+      return res.status(400).send('Verification link has expired. Please request a new email.');
+    }
+
+    await prisma.user.update({ where: { id: record.userId }, data: { emailVerified: true } });
+    await prisma.emailVerificationToken.deleteMany({ where: { userId: record.userId } });
+
+    return res.send('Email verified successfully. You can close this window.');
+  } catch (error) {
+    console.error('Email verification error:', error);
+    return res.status(500).send('Server error verifying email.');
   }
 });
 
