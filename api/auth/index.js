@@ -22,7 +22,41 @@ function createAccessToken(user) {
   });
 }
 
-async function createRefreshToken(userId) {
+function getClientContext(req) {
+  const forwardedFor = req.headers['x-forwarded-for'];
+  const forwardedIp = Array.isArray(forwardedFor)
+    ? forwardedFor[0]
+    : typeof forwardedFor === 'string'
+    ? forwardedFor.split(',')[0]
+    : undefined;
+
+  return {
+    userAgent: req.headers['user-agent'] || 'Unknown',
+    ipAddress: forwardedIp || req.ip || 'Unknown',
+    deviceId: req.body?.deviceId || req.query?.deviceId || req.headers['x-device-id'] || 'unknown',
+    location: req.body?.location || req.query?.location || req.headers['x-user-location'] || null,
+  };
+}
+
+async function logSession({ userId, refreshToken, userAgent, ipAddress, deviceId, location, expiresAt }) {
+  try {
+    await prisma.sessionLog.create({
+      data: {
+        userId,
+        refreshToken,
+        userAgent,
+        ipAddress,
+        deviceId,
+        location,
+        expiresAt,
+      },
+    });
+  } catch (error) {
+    console.error('Session logging error:', error);
+  }
+}
+
+async function createRefreshToken(userId, sessionContext) {
   const tokenValue = crypto.randomBytes(40).toString('hex');
   const expiresAt = new Date(Date.now() + REFRESH_TOKEN_EXPIRES_IN_MS);
 
@@ -34,7 +68,16 @@ async function createRefreshToken(userId) {
     },
   });
 
-  return refreshToken.token;
+  if (sessionContext) {
+    await logSession({
+      userId,
+      refreshToken: refreshToken.token,
+      expiresAt,
+      ...sessionContext,
+    });
+  }
+
+  return { token: refreshToken.token, expiresAt };
 }
 
 async function revokeRefreshToken(token) {
@@ -47,6 +90,36 @@ async function revokeRefreshToken(token) {
     if (error.code !== 'P2025') {
       console.error('Refresh token revocation error:', error);
     }
+  }
+}
+
+async function revokeSessionByRefreshToken(token) {
+  try {
+    await prisma.sessionLog.updateMany({
+      where: { refreshToken: token, revoked: false },
+      data: { revoked: true },
+    });
+  } catch (error) {
+    console.error('Session revocation error:', error);
+  }
+}
+
+async function revokeSessionById(sessionId, userId) {
+  try {
+    const session = await prisma.sessionLog.findUnique({ where: { id: sessionId } });
+
+    if (!session || session.userId !== userId) {
+      return null;
+    }
+
+    await prisma.sessionLog.update({ where: { id: sessionId }, data: { revoked: true } });
+
+    await revokeRefreshToken(session.refreshToken);
+
+    return session;
+  } catch (error) {
+    console.error('Session revocation by ID error:', error);
+    return null;
   }
 }
 
@@ -119,8 +192,9 @@ router.post('/register', async (req, res) => {
       },
     });
 
+    const sessionContext = getClientContext(req);
     const accessToken = createAccessToken(user);
-    const refreshToken = await createRefreshToken(user.id);
+    const { token: refreshToken } = await createRefreshToken(user.id, sessionContext);
 
     return res.status(201).json({
       accessToken,
@@ -157,8 +231,9 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
+    const sessionContext = getClientContext(req);
     const accessToken = createAccessToken(user);
-    const refreshToken = await createRefreshToken(user.id);
+    const { token: refreshToken } = await createRefreshToken(user.id, sessionContext);
 
     return res.json({
       accessToken,
@@ -222,6 +297,7 @@ router.post('/refresh', async (req, res) => {
     if (!existingToken || existingToken.revoked || existingToken.expiresAt <= new Date()) {
       if (existingToken && existingToken.expiresAt <= new Date()) {
         await revokeRefreshToken(refreshToken);
+        await revokeSessionByRefreshToken(refreshToken);
       }
 
       return res.status(401).json({ error: 'Invalid or expired refresh token' });
@@ -234,9 +310,12 @@ router.post('/refresh', async (req, res) => {
       return res.status(401).json({ error: 'Invalid refresh token' });
     }
 
-    await revokeRefreshToken(refreshToken);
+    const sessionContext = getClientContext(req);
 
-    const newRefreshToken = await createRefreshToken(user.id);
+    await revokeRefreshToken(refreshToken);
+    await revokeSessionByRefreshToken(refreshToken);
+
+    const { token: newRefreshToken } = await createRefreshToken(user.id, sessionContext);
     const accessToken = createAccessToken(user);
 
     return res.json({ accessToken, refreshToken: newRefreshToken });
@@ -251,6 +330,7 @@ router.post('/logout', authenticateToken, async (req, res) => {
 
   if (refreshToken) {
     await revokeRefreshToken(refreshToken);
+    await revokeSessionByRefreshToken(refreshToken);
   }
 
   return res.json({ message: 'Logged out successfully.' });
@@ -287,8 +367,9 @@ router.get(
   passport.authenticate('google', { session: false, failureRedirect: '/api/auth/google/failure' }),
   async (req, res) => {
     try {
+      const sessionContext = getClientContext(req);
       const accessToken = createAccessToken(req.user);
-      const refreshToken = await createRefreshToken(req.user.id);
+      const { token: refreshToken } = await createRefreshToken(req.user.id, sessionContext);
 
       const redirectUrl = `${frontendBaseUrl}/auth/callback?accessToken=${encodeURIComponent(
         accessToken
@@ -304,6 +385,49 @@ router.get(
 
 router.get('/google/failure', (_req, res) => {
   return res.status(401).json({ error: 'Google authentication failed' });
+});
+
+router.get('/sessions', authenticateToken, async (req, res) => {
+  try {
+    const sessions = await prisma.sessionLog.findMany({
+      where: {
+        userId: req.user.id,
+        revoked: false,
+        expiresAt: { gt: new Date() },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    return res.json({
+      sessions: sessions.map((session) => ({
+        id: session.id,
+        userAgent: session.userAgent,
+        ipAddress: session.ipAddress,
+        deviceId: session.deviceId,
+        location: session.location,
+        createdAt: session.createdAt,
+        expiresAt: session.expiresAt,
+      })),
+    });
+  } catch (error) {
+    console.error('Session list error:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.delete('/sessions/:id', authenticateToken, async (req, res) => {
+  try {
+    const revokedSession = await revokeSessionById(req.params.id, req.user.id);
+
+    if (!revokedSession) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    return res.json({ message: 'Session revoked' });
+  } catch (error) {
+    console.error('Session revoke error:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
 });
 
 module.exports = router;

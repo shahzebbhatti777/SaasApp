@@ -16,6 +16,7 @@ model User {
   updatedAt DateTime @updatedAt
   resets    PasswordReset[]
   refreshes RefreshToken[]
+  sessions  SessionLog[]
 }
 
 model PasswordReset {
@@ -35,4 +36,18 @@ model RefreshToken {
   expiresAt DateTime
   createdAt DateTime @default(now())
   revoked   Boolean  @default(false)
+}
+
+model SessionLog {
+  id           String   @id @default(uuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id])
+  refreshToken String
+  userAgent    String
+  ipAddress    String
+  deviceId     String
+  location     String?
+  createdAt    DateTime @default(now())
+  expiresAt    DateTime
+  revoked      Boolean  @default(false)
 }
