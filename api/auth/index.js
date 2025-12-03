@@ -142,6 +142,40 @@ router.post('/login', async (req, res) => {
   }
 });
 
+router.post('/reset-password', async (req, res) => {
+  const { token, newPassword } = req.body || {};
+
+  if (!token || !newPassword) {
+    return res.status(400).json({ error: 'Token and new password are required' });
+  }
+
+  try {
+    const resetRequest = await prisma.passwordReset.findUnique({ where: { token } });
+
+    if (!resetRequest || resetRequest.expiresAt <= new Date()) {
+      if (resetRequest) {
+        await prisma.passwordReset.delete({ where: { id: resetRequest.id } });
+      }
+
+      return res.status(404).json({ error: 'Invalid or expired token' });
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    await prisma.user.update({
+      where: { id: resetRequest.userId },
+      data: { password: hashedPassword },
+    });
+
+    await prisma.passwordReset.delete({ where: { id: resetRequest.id } });
+
+    return res.json({ message: 'Password reset successful.' });
+  } catch (error) {
+    console.error('Password reset error:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
 router.get('/me', authenticateToken, async (req, res) => {
   try {
     const user = await prisma.user.findUnique({ where: { id: req.user.id } });
