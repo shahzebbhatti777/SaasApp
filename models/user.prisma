@@ -25,6 +25,7 @@ model User {
   emailVerified Boolean @default(false)
   mfaEnabled Boolean  @default(false)
   mfaSecret  String?
+  lastMfaVerifiedAt DateTime?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
   resets    PasswordReset[]

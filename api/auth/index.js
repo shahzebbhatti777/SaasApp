@@ -6,7 +6,7 @@ const passport = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const crypto = require('crypto');
 const axios = require('axios');
-const { authenticateToken } = require('./auth');
+const { authenticateToken, requireRecentMfa } = require('./auth');
 const speakeasy = require('speakeasy');
 const QRCode = require('qrcode');
 const nodemailer = require('nodemailer');
@@ -86,7 +86,47 @@ function createAccessToken(user) {
   });
 }
 
-async function issueTokens(user, req) {
+async function cleanupExpiredRefreshTokens(userId) {
+  const now = new Date();
+  const expiredTokens = await prisma.refreshToken.findMany({
+    where: { userId, expiresAt: { lte: now } },
+    select: { token: true },
+  });
+
+  if (!expiredTokens.length) {
+    return;
+  }
+
+  const expiredTokenValues = expiredTokens.map((t) => t.token);
+
+  await prisma.sessionLog.updateMany({
+    where: { refreshToken: { in: expiredTokenValues } },
+    data: { revoked: true },
+  });
+
+  await prisma.refreshToken.deleteMany({ where: { token: { in: expiredTokenValues } } });
+}
+
+async function rotateUserSessions(userId) {
+  await cleanupExpiredRefreshTokens(userId);
+
+  await prisma.refreshToken.updateMany({
+    where: { userId, revoked: false },
+    data: { revoked: true },
+  });
+
+  await prisma.sessionLog.updateMany({ where: { userId, revoked: false }, data: { revoked: true } });
+}
+
+async function issueTokens(user, req, options = {}) {
+  const { rotateSessions = false } = options;
+
+  if (rotateSessions) {
+    await rotateUserSessions(user.id);
+  } else {
+    await cleanupExpiredRefreshTokens(user.id);
+  }
+
   const sessionContext = getClientContext(req);
   const accessToken = createAccessToken(user);
   const { token: refreshToken } = await createRefreshToken(user.id, sessionContext);
@@ -228,6 +268,14 @@ async function sendVerificationEmail(email, token) {
     text: `Welcome to MARQ OS! Please verify your email by visiting: ${verifyUrl}\n\nIf you did not request this, you can ignore this email.`,
     html: `<p>Welcome to MARQ OS!</p><p>Please verify your email by clicking the link below:</p><p><a href="${verifyUrl}">${verifyUrl}</a></p><p>If you did not request this, you can ignore this email.</p>`,
   });
+}
+
+async function recordMfaVerification(userId) {
+  try {
+    await prisma.user.update({ where: { id: userId }, data: { lastMfaVerifiedAt: new Date() } });
+  } catch (error) {
+    console.error('MFA verification timestamp error:', error);
+  }
 }
 
 async function revokeSessionById(sessionId, userId) {
@@ -540,7 +588,7 @@ async function completeOAuthLogin(user, req, res, redirectTarget) {
     return res.status(statusError.status).json(statusError.body);
   }
 
-  const tokens = await issueTokens(user, req);
+  const tokens = await issueTokens(user, req, { rotateSessions: true });
 
   if (redirectTarget) {
     const redirectUrl = `${redirectTarget}?accessToken=${encodeURIComponent(tokens.accessToken)}&refreshToken=${encodeURIComponent(
@@ -697,7 +745,7 @@ router.post('/login', async (req, res) => {
       return res.status(403).json({ error: 'MFA required', mfaRequired: true });
     }
 
-    const { accessToken, refreshToken } = await issueTokens(user, req);
+    const { accessToken, refreshToken } = await issueTokens(user, req, { rotateSessions: true });
 
     return res.json({
       accessToken,
@@ -752,7 +800,9 @@ router.post('/mfa/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid MFA token' });
     }
 
-    const { accessToken, refreshToken } = await issueTokens(user, req);
+    await recordMfaVerification(user.id);
+
+    const { accessToken, refreshToken } = await issueTokens(user, req, { rotateSessions: true });
 
     return res.json({
       accessToken,
@@ -887,6 +937,18 @@ router.post('/logout', authenticateToken, async (req, res) => {
   return res.json({ message: 'Logged out successfully.' });
 });
 
+router.post('/logout-all', authenticateToken, requireRecentMfa, async (req, res) => {
+  try {
+    await prisma.refreshToken.updateMany({ where: { userId: req.user.id }, data: { revoked: true } });
+    await prisma.sessionLog.updateMany({ where: { userId: req.user.id }, data: { revoked: true } });
+
+    return res.json({ message: 'Logged out from all devices.' });
+  } catch (error) {
+    console.error('Logout-all error:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
 router.post('/mfa/setup', authenticateToken, async (req, res) => {
   try {
     const user = await prisma.user.findUnique({ where: { id: req.user.id } });
@@ -935,7 +997,10 @@ router.post('/mfa/verify', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Invalid token' });
     }
 
-    await prisma.user.update({ where: { id: user.id }, data: { mfaEnabled: true } });
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { mfaEnabled: true, lastMfaVerifiedAt: new Date() },
+    });
 
     return res.json({ message: 'MFA enabled successfully' });
   } catch (error) {
@@ -1088,7 +1153,7 @@ router.get('/sessions', authenticateToken, async (req, res) => {
   }
 });
 
-router.delete('/sessions/:id', authenticateToken, async (req, res) => {
+router.delete('/sessions/:id', authenticateToken, requireRecentMfa, async (req, res) => {
   try {
     const revokedSession = await revokeSessionById(req.params.id, req.user.id);
 
