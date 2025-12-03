@@ -5,6 +5,7 @@ const { PrismaClient } = require('@prisma/client');
 const passport = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const crypto = require('crypto');
+const axios = require('axios');
 const { authenticateToken } = require('./auth');
 const speakeasy = require('speakeasy');
 const QRCode = require('qrcode');
@@ -17,8 +18,25 @@ const frontendBaseUrl = (process.env.FRONTEND_URL || 'https://yourfrontend.com')
 const ACCESS_TOKEN_EXPIRES_IN = '15m';
 const REFRESH_TOKEN_EXPIRES_IN_MS = 7 * 24 * 60 * 60 * 1000;
 const EMAIL_TOKEN_EXPIRES_IN_MS = 60 * 60 * 1000;
+const SUPPORTED_OAUTH_PROVIDERS = ['google', 'apple', 'tiktok', 'wechat'];
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function formatUserResponse(user) {
+  return {
+    id: user.id,
+    email: user.email,
+    name: user.name,
+    role: user.role,
+    parentId: user.parentId,
+    accountOwnerId: user.parentId || user.id,
+    permissions: user.permissions,
+    provider: user.provider,
+    providerId: user.providerId,
+    avatar: user.avatar,
+    emailVerified: user.emailVerified,
+  };
+}
 
 async function resolveAccountOwner(user) {
   if (!user.parentId) {
@@ -231,6 +249,310 @@ async function revokeSessionById(sessionId, userId) {
   }
 }
 
+function getCallbackUrl(req, provider) {
+  const base = (process.env.API_BASE_URL || `${req.protocol}://${req.get('host') || ''}`).replace(/\/$/, '');
+  return `${base}/api/auth/oauth/${provider}/callback`;
+}
+
+function resolveRedirectTarget(state) {
+  if (state && state.startsWith(frontendBaseUrl)) {
+    return state;
+  }
+
+  return `${frontendBaseUrl}/auth/callback`;
+}
+
+function getOAuthProviderSettings(provider) {
+  switch (provider) {
+    case 'google':
+      return {
+        clientId: process.env.GOOGLE_CLIENT_ID,
+        clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+        scope: ['profile', 'email'],
+      };
+    case 'apple':
+      return {
+        clientId: process.env.APPLE_CLIENT_ID,
+        clientSecret: process.env.APPLE_CLIENT_SECRET,
+        scope: ['name', 'email'],
+      };
+    case 'tiktok':
+      return {
+        clientId: process.env.TIKTOK_CLIENT_KEY,
+        clientSecret: process.env.TIKTOK_CLIENT_SECRET,
+        scope: ['user.info.basic', 'user.info.email'],
+      };
+    case 'wechat':
+      return {
+        clientId: process.env.WECHAT_APP_ID,
+        clientSecret: process.env.WECHAT_APP_SECRET,
+        scope: ['snsapi_login'],
+      };
+    default:
+      return null;
+  }
+}
+
+function buildAuthUrl(provider, callbackUrl, state) {
+  const settings = getOAuthProviderSettings(provider);
+
+  if (!settings || !settings.clientId || !settings.clientSecret) {
+    return null;
+  }
+
+  const params = new URLSearchParams();
+
+  switch (provider) {
+    case 'google': {
+      params.set('client_id', settings.clientId);
+      params.set('redirect_uri', callbackUrl);
+      params.set('response_type', 'code');
+      params.set('scope', settings.scope.join(' '));
+      params.set('access_type', 'offline');
+      params.set('prompt', 'consent');
+      if (state) params.set('state', state);
+      return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+    }
+    case 'apple': {
+      params.set('client_id', settings.clientId);
+      params.set('redirect_uri', callbackUrl);
+      params.set('response_type', 'code');
+      params.set('response_mode', 'query');
+      params.set('scope', settings.scope.join(' '));
+      if (state) params.set('state', state);
+      return `https://appleid.apple.com/auth/authorize?${params.toString()}`;
+    }
+    case 'tiktok': {
+      params.set('client_key', settings.clientId);
+      params.set('redirect_uri', callbackUrl);
+      params.set('response_type', 'code');
+      params.set('scope', settings.scope.join(','));
+      if (state) params.set('state', state);
+      return `https://www.tiktok.com/v2/auth/authorize/?${params.toString()}`;
+    }
+    case 'wechat': {
+      params.set('appid', settings.clientId);
+      params.set('redirect_uri', callbackUrl);
+      params.set('response_type', 'code');
+      params.set('scope', 'snsapi_login');
+      if (state) params.set('state', state);
+      return `https://open.weixin.qq.com/connect/qrconnect?${params.toString()}#wechat_redirect`;
+    }
+    default:
+      return null;
+  }
+}
+
+async function exchangeCodeForProfile(provider, code, callbackUrl) {
+  const settings = getOAuthProviderSettings(provider);
+
+  if (!settings || !settings.clientId || !settings.clientSecret) {
+    throw new Error('OAuth provider not configured');
+  }
+
+  switch (provider) {
+    case 'google': {
+      const tokenResponse = await axios.post(
+        'https://oauth2.googleapis.com/token',
+        new URLSearchParams({
+          code,
+          client_id: settings.clientId,
+          client_secret: settings.clientSecret,
+          redirect_uri: callbackUrl,
+          grant_type: 'authorization_code',
+        }).toString(),
+        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+      );
+
+      const accessToken = tokenResponse.data.access_token;
+
+      const profileResponse = await axios.get('https://www.googleapis.com/oauth2/v3/userinfo', {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+
+      const profile = profileResponse.data || {};
+
+      return {
+        email: profile.email,
+        name: profile.name || profile.given_name || profile.family_name || 'Google User',
+        provider: 'google',
+        providerId: profile.sub,
+        avatar: profile.picture,
+      };
+    }
+    case 'apple': {
+      const tokenResponse = await axios.post(
+        'https://appleid.apple.com/auth/token',
+        new URLSearchParams({
+          code,
+          client_id: settings.clientId,
+          client_secret: settings.clientSecret,
+          grant_type: 'authorization_code',
+          redirect_uri: callbackUrl,
+        }).toString(),
+        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+      );
+
+      const idToken = tokenResponse.data.id_token;
+      const decoded = jwt.decode(idToken) || {};
+
+      return {
+        email: decoded.email,
+        name: decoded.name || decoded.email || 'Apple User',
+        provider: 'apple',
+        providerId: decoded.sub,
+        avatar: null,
+      };
+    }
+    case 'tiktok': {
+      const tokenResponse = await axios.post(
+        'https://open.tiktokapis.com/v2/oauth/token',
+        {
+          client_key: settings.clientId,
+          client_secret: settings.clientSecret,
+          code,
+          grant_type: 'authorization_code',
+          redirect_uri: callbackUrl,
+        },
+        { headers: { 'Content-Type': 'application/json' } }
+      );
+
+      const tokenData = tokenResponse.data?.data || tokenResponse.data || {};
+      const accessToken = tokenData.access_token;
+      const openId = tokenData.open_id || tokenData.openid;
+
+      const profileResponse = await axios.post(
+        'https://open.tiktokapis.com/v2/user/info/',
+        { fields: ['open_id', 'union_id', 'avatar_url', 'display_name', 'email'] },
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+
+      const profile = profileResponse.data?.data?.user || profileResponse.data?.data || {};
+
+      return {
+        email: profile.email,
+        name: profile.display_name || 'TikTok User',
+        provider: 'tiktok',
+        providerId: profile.open_id || profile.union_id || openId,
+        avatar: profile.avatar_url,
+      };
+    }
+    case 'wechat': {
+      const tokenResponse = await axios.get('https://api.weixin.qq.com/sns/oauth2/access_token', {
+        params: {
+          appid: settings.clientId,
+          secret: settings.clientSecret,
+          code,
+          grant_type: 'authorization_code',
+        },
+      });
+
+      const { access_token: accessToken, openid, unionid } = tokenResponse.data || {};
+
+      const profileResponse = await axios.get('https://api.weixin.qq.com/sns/userinfo', {
+        params: {
+          access_token: accessToken,
+          openid,
+          lang: 'en',
+        },
+      });
+
+      const profile = profileResponse.data || {};
+
+      return {
+        email: null,
+        name: profile.nickname || 'WeChat User',
+        provider: 'wechat',
+        providerId: unionid || openid,
+        avatar: profile.headimgurl,
+      };
+    }
+    default:
+      throw new Error('Unsupported provider');
+  }
+}
+
+async function findOrCreateOAuthUser(profile) {
+  if (!profile.provider || (!profile.email && !profile.providerId)) {
+    throw new Error('Missing provider profile data');
+  }
+
+  const fallbackEmail = `${profile.providerId || crypto.randomBytes(10).toString('hex')}@${profile.provider}.oauth`;
+
+  let user = null;
+
+  if (profile.providerId) {
+    user = await prisma.user.findFirst({ where: { provider: profile.provider, providerId: profile.providerId } });
+  }
+
+  if (!user && profile.email) {
+    user = await prisma.user.findUnique({ where: { email: profile.email } });
+  }
+
+  if (user) {
+    const updates = {};
+
+    if (!user.emailVerified && profile.email) {
+      updates.emailVerified = true;
+    }
+
+    if (!user.provider) {
+      updates.provider = profile.provider;
+    }
+
+    if (!user.providerId && profile.providerId) {
+      updates.providerId = profile.providerId;
+    }
+
+    if (profile.avatar && profile.avatar !== user.avatar) {
+      updates.avatar = profile.avatar;
+    }
+
+    if (!user.name && profile.name) {
+      updates.name = profile.name;
+    }
+
+    if (Object.keys(updates).length) {
+      user = await prisma.user.update({ where: { id: user.id }, data: updates });
+    }
+  } else {
+    user = await prisma.user.create({
+      data: {
+        email: profile.email || fallbackEmail,
+        password: '',
+        name: profile.name || `${profile.provider} user`,
+        provider: profile.provider,
+        providerId: profile.providerId,
+        avatar: profile.avatar || null,
+        emailVerified: true,
+      },
+    });
+  }
+
+  return user;
+}
+
+async function completeOAuthLogin(user, req, res, redirectTarget) {
+  const { owner } = await resolveAccountOwner(user);
+  const statusError = evaluateAccountStatus(user, owner);
+
+  if (statusError) {
+    return res.status(statusError.status).json(statusError.body);
+  }
+
+  const tokens = await issueTokens(user, req);
+
+  if (redirectTarget) {
+    const redirectUrl = `${redirectTarget}?accessToken=${encodeURIComponent(tokens.accessToken)}&refreshToken=${encodeURIComponent(
+      tokens.refreshToken
+    )}`;
+
+    return res.redirect(redirectUrl);
+  }
+
+  return res.json({ ...tokens, user: formatUserResponse(user) });
+}
+
 passport.use(
   new GoogleStrategy(
     {
@@ -241,33 +563,24 @@ passport.use(
     async (_accessToken, _refreshToken, profile, done) => {
       try {
         const email = profile.emails && profile.emails[0] && profile.emails[0].value;
+        const avatar = profile.photos && profile.photos[0] && profile.photos[0].value;
 
-        if (!email) {
-          return done(null, false, { message: 'Email not available from Google profile' });
+        const providerProfile = {
+          email,
+          name:
+            profile.displayName ||
+            [profile.name?.givenName, profile.name?.familyName].filter(Boolean).join(' ') ||
+            'Google User',
+          provider: 'google',
+          providerId: profile.id || profile._json?.sub,
+          avatar,
+        };
+
+        if (!providerProfile.providerId) {
+          return done(null, false, { message: 'Google profile missing id' });
         }
 
-        const nameFromProfile =
-          profile.displayName ||
-          [profile.name?.givenName, profile.name?.familyName].filter(Boolean).join(' ') ||
-          'Google User';
-
-        let user = await prisma.user.findUnique({ where: { email } });
-
-        if (!user) {
-          user = await prisma.user.create({
-            data: {
-              email,
-              name: nameFromProfile,
-              password: '',
-              emailVerified: true,
-            },
-          });
-        } else if (!user.emailVerified) {
-          user = await prisma.user.update({
-            where: { id: user.id },
-            data: { emailVerified: true },
-          });
-        }
+        const user = await findOrCreateOAuthUser(providerProfile);
 
         return done(null, {
           id: user.id,
@@ -317,16 +630,7 @@ router.post('/register', async (req, res) => {
 
     return res.status(201).json({
       message: 'Registration successful. Please verify your email to continue.',
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        emailVerified: user.emailVerified,
-        role: user.role,
-        parentId: user.parentId,
-        accountOwnerId: user.parentId || user.id,
-        permissions: user.permissions,
-      },
+      user: formatUserResponse(user),
     });
   } catch (error) {
     console.error('Registration error:', error);
@@ -398,15 +702,7 @@ router.post('/login', async (req, res) => {
     return res.json({
       accessToken,
       refreshToken,
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        role: user.role,
-        parentId: user.parentId,
-        accountOwnerId: owner?.id || user.id,
-        permissions: user.permissions,
-      },
+      user: formatUserResponse(owner || user),
     });
   } catch (error) {
     console.error('Login error:', error);
@@ -461,15 +757,7 @@ router.post('/mfa/login', async (req, res) => {
     return res.json({
       accessToken,
       refreshToken,
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        role: user.role,
-        parentId: user.parentId,
-        accountOwnerId: owner?.id || user.id,
-        permissions: user.permissions,
-      },
+      user: formatUserResponse(owner || user),
     });
   } catch (error) {
     console.error('MFA login error:', error);
@@ -665,17 +953,78 @@ router.get('/me', authenticateToken, async (req, res) => {
     }
 
     return res.json({
-      id: user.id,
-      email: user.email,
-      name: user.name,
-      role: user.role,
-      parentId: user.parentId,
-      accountOwnerId: user.parentId || user.id,
-      permissions: user.permissions,
+      ...formatUserResponse(user),
     });
   } catch (error) {
     console.error('Profile fetch error:', error);
     return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.get('/oauth/:provider', (req, res) => {
+  const provider = (req.params.provider || '').toLowerCase();
+
+  if (!SUPPORTED_OAUTH_PROVIDERS.includes(provider)) {
+    return res.status(400).json({ error: 'Unsupported provider' });
+  }
+
+  const callbackUrl = getCallbackUrl(req, provider);
+  const state = req.query.redirect && req.query.redirect.startsWith(frontendBaseUrl) ? req.query.redirect : req.query.state;
+  const authUrl = buildAuthUrl(provider, callbackUrl, state);
+
+  if (!authUrl) {
+    return res.status(400).json({ error: 'OAuth provider not configured' });
+  }
+
+  return res.redirect(authUrl);
+});
+
+router.get('/oauth/:provider/callback', async (req, res) => {
+  const provider = (req.params.provider || '').toLowerCase();
+  const { code, state } = req.query;
+
+  if (!SUPPORTED_OAUTH_PROVIDERS.includes(provider)) {
+    return res.status(400).json({ error: 'Unsupported provider' });
+  }
+
+  if (!code) {
+    return res.status(400).json({ error: 'Missing authorization code' });
+  }
+
+  try {
+    const callbackUrl = getCallbackUrl(req, provider);
+    const profile = await exchangeCodeForProfile(provider, code, callbackUrl);
+    const user = await findOrCreateOAuthUser(profile);
+    const redirectTarget = resolveRedirectTarget(state);
+
+    return await completeOAuthLogin(user, req, res, redirectTarget);
+  } catch (error) {
+    console.error(`${provider} OAuth callback error:`, error);
+    return res.status(400).json({ error: 'OAuth callback failed' });
+  }
+});
+
+router.post('/oauth/:provider/token', async (req, res) => {
+  const provider = (req.params.provider || '').toLowerCase();
+  const { code, redirectUri } = req.body || {};
+
+  if (!SUPPORTED_OAUTH_PROVIDERS.includes(provider)) {
+    return res.status(400).json({ error: 'Unsupported provider' });
+  }
+
+  if (!code) {
+    return res.status(400).json({ error: 'Missing authorization code' });
+  }
+
+  try {
+    const callbackUrl = redirectUri || getCallbackUrl(req, provider);
+    const profile = await exchangeCodeForProfile(provider, code, callbackUrl);
+    const user = await findOrCreateOAuthUser(profile);
+
+    return await completeOAuthLogin(user, req, res);
+  } catch (error) {
+    console.error(`${provider} OAuth token exchange error:`, error);
+    return res.status(400).json({ error: 'OAuth token exchange failed' });
   }
 });
 
@@ -697,22 +1046,9 @@ router.get(
         return res.status(404).json({ error: 'User not found' });
       }
 
-      const { owner } = await resolveAccountOwner(dbUser);
-      const statusError = evaluateAccountStatus(dbUser, owner);
+      const redirectTarget = resolveRedirectTarget(req.query.state || req.query.redirect);
 
-      if (statusError) {
-        return res.status(statusError.status).json(statusError.body);
-      }
-
-      const sessionContext = getClientContext(req);
-      const accessToken = createAccessToken(dbUser);
-      const { token: refreshToken } = await createRefreshToken(dbUser.id, sessionContext);
-
-      const redirectUrl = `${frontendBaseUrl}/auth/callback?accessToken=${encodeURIComponent(
-        accessToken
-      )}&refreshToken=${encodeURIComponent(refreshToken)}`;
-
-      return res.redirect(redirectUrl);
+      return await completeOAuthLogin(dbUser, req, res, redirectTarget);
     } catch (error) {
       console.error('Google callback token error:', error);
       return res.status(500).json({ error: 'Server error' });

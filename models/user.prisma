@@ -11,6 +11,9 @@ model User {
   id        String   @id @default(uuid())
   email     String   @unique
   password  String
+  provider  String?
+  providerId String?
+  avatar    String?
   name      String
   parentId  String?
   parent    User?    @relation("SubAccounts", fields: [parentId], references: [id])
@@ -30,6 +33,8 @@ model User {
   emailVerifications EmailVerificationToken[]
   adminAuditLogs  AuditLog[] @relation("AdminActor")
   userAuditLogs   AuditLog[] @relation("UserSubject")
+
+  @@unique([provider, providerId])
 }
 
 model PasswordReset {
