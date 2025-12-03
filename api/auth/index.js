@@ -4,14 +4,51 @@ const jwt = require('jsonwebtoken');
 const { PrismaClient } = require('@prisma/client');
 const passport = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
+const crypto = require('crypto');
 const { authenticateToken } = require('./auth');
 
 const router = express.Router();
 const prisma = new PrismaClient();
 
 const frontendBaseUrl = (process.env.FRONTEND_URL || 'https://yourfrontend.com').replace(/\/$/, '');
+const ACCESS_TOKEN_EXPIRES_IN = '15m';
+const REFRESH_TOKEN_EXPIRES_IN_MS = 7 * 24 * 60 * 60 * 1000;
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function createAccessToken(user) {
+  return jwt.sign({ id: user.id, email: user.email }, process.env.JWT_SECRET, {
+    expiresIn: ACCESS_TOKEN_EXPIRES_IN,
+  });
+}
+
+async function createRefreshToken(userId) {
+  const tokenValue = crypto.randomBytes(40).toString('hex');
+  const expiresAt = new Date(Date.now() + REFRESH_TOKEN_EXPIRES_IN_MS);
+
+  const refreshToken = await prisma.refreshToken.create({
+    data: {
+      token: tokenValue,
+      userId,
+      expiresAt,
+    },
+  });
+
+  return refreshToken.token;
+}
+
+async function revokeRefreshToken(token) {
+  try {
+    await prisma.refreshToken.update({
+      where: { token },
+      data: { revoked: true },
+    });
+  } catch (error) {
+    if (error.code !== 'P2025') {
+      console.error('Refresh token revocation error:', error);
+    }
+  }
+}
 
 passport.use(
   new GoogleStrategy(
@@ -82,14 +119,12 @@ router.post('/register', async (req, res) => {
       },
     });
 
-    const token = jwt.sign(
-      { id: user.id, email: user.email },
-      process.env.JWT_SECRET,
-      { expiresIn: '7d' }
-    );
+    const accessToken = createAccessToken(user);
+    const refreshToken = await createRefreshToken(user.id);
 
     return res.status(201).json({
-      token,
+      accessToken,
+      refreshToken,
       user: {
         id: user.id,
         email: user.email,
@@ -122,14 +157,12 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    const token = jwt.sign(
-      { id: user.id, email: user.email },
-      process.env.JWT_SECRET,
-      { expiresIn: '7d' }
-    );
+    const accessToken = createAccessToken(user);
+    const refreshToken = await createRefreshToken(user.id);
 
     return res.json({
-      token,
+      accessToken,
+      refreshToken,
       user: {
         id: user.id,
         email: user.email,
@@ -176,7 +209,50 @@ router.post('/reset-password', async (req, res) => {
   }
 });
 
-router.post('/logout', authenticateToken, (req, res) => {
+router.post('/refresh', async (req, res) => {
+  const { refreshToken } = req.body || {};
+
+  if (!refreshToken) {
+    return res.status(400).json({ error: 'Refresh token is required' });
+  }
+
+  try {
+    const existingToken = await prisma.refreshToken.findUnique({ where: { token: refreshToken } });
+
+    if (!existingToken || existingToken.revoked || existingToken.expiresAt <= new Date()) {
+      if (existingToken && existingToken.expiresAt <= new Date()) {
+        await revokeRefreshToken(refreshToken);
+      }
+
+      return res.status(401).json({ error: 'Invalid or expired refresh token' });
+    }
+
+    const user = await prisma.user.findUnique({ where: { id: existingToken.userId } });
+
+    if (!user) {
+      await revokeRefreshToken(refreshToken);
+      return res.status(401).json({ error: 'Invalid refresh token' });
+    }
+
+    await revokeRefreshToken(refreshToken);
+
+    const newRefreshToken = await createRefreshToken(user.id);
+    const accessToken = createAccessToken(user);
+
+    return res.json({ accessToken, refreshToken: newRefreshToken });
+  } catch (error) {
+    console.error('Refresh token error:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.post('/logout', authenticateToken, async (req, res) => {
+  const { refreshToken } = req.body || {};
+
+  if (refreshToken) {
+    await revokeRefreshToken(refreshToken);
+  }
+
   return res.json({ message: 'Logged out successfully.' });
 });
 
@@ -209,16 +285,20 @@ router.get(
 router.get(
   '/google/callback',
   passport.authenticate('google', { session: false, failureRedirect: '/api/auth/google/failure' }),
-  (req, res) => {
-    const token = jwt.sign(
-      { id: req.user.id, email: req.user.email },
-      process.env.JWT_SECRET,
-      { expiresIn: '7d' }
-    );
+  async (req, res) => {
+    try {
+      const accessToken = createAccessToken(req.user);
+      const refreshToken = await createRefreshToken(req.user.id);
 
-    const redirectUrl = `${frontendBaseUrl}/auth/callback?token=${encodeURIComponent(token)}`;
+      const redirectUrl = `${frontendBaseUrl}/auth/callback?accessToken=${encodeURIComponent(
+        accessToken
+      )}&refreshToken=${encodeURIComponent(refreshToken)}`;
 
-    return res.redirect(redirectUrl);
+      return res.redirect(redirectUrl);
+    } catch (error) {
+      console.error('Google callback token error:', error);
+      return res.status(500).json({ error: 'Server error' });
+    }
   }
 );
 
