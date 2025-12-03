@@ -12,6 +12,11 @@ model User {
   email     String   @unique
   password  String
   name      String
+  parentId  String?
+  parent    User?    @relation("SubAccounts", fields: [parentId], references: [id])
+  subAccounts User[] @relation("SubAccounts")
+  role      String   @default("user")
+  permissions String[] @default([])
   accountLocked      Boolean   @default(false)
   forcePasswordReset Boolean   @default(false)
   emailVerified Boolean @default(false)

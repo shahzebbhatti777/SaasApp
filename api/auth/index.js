@@ -20,8 +20,50 @@ const EMAIL_TOKEN_EXPIRES_IN_MS = 60 * 60 * 1000;
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+async function resolveAccountOwner(user) {
+  if (!user.parentId) {
+    return { owner: user, parent: null };
+  }
+
+  const parent = await prisma.user.findUnique({ where: { id: user.parentId } });
+  return { owner: parent || user, parent };
+}
+
+function evaluateAccountStatus(actor, owner) {
+  const controlling = owner || actor;
+
+  if (!controlling) {
+    return { status: 401, body: { error: 'Account unavailable' } };
+  }
+
+  if (actor.accountLocked || controlling.accountLocked) {
+    return { status: 403, body: { error: 'Account locked by admin' } };
+  }
+
+  if ((!actor.parentId && !actor.emailVerified) || (actor.parentId && !controlling.emailVerified)) {
+    return { status: 403, body: { error: 'Email not verified' } };
+  }
+
+  if (actor.forcePasswordReset || controlling.forcePasswordReset) {
+    return { status: 403, body: { error: 'Password reset required', mustReset: true } };
+  }
+
+  return null;
+}
+
+function buildTokenPayload(user) {
+  const parentId = user.parentId || null;
+  return {
+    id: user.id,
+    email: user.email,
+    role: user.role || 'user',
+    parentId,
+    accountOwnerId: parentId || user.id,
+  };
+}
+
 function createAccessToken(user) {
-  return jwt.sign({ id: user.id, email: user.email }, process.env.JWT_SECRET, {
+  return jwt.sign(buildTokenPayload(user), process.env.JWT_SECRET, {
     expiresIn: ACCESS_TOKEN_EXPIRES_IN,
   });
 }
@@ -231,6 +273,8 @@ passport.use(
           id: user.id,
           email: user.email,
           name: user.name,
+          role: user.role,
+          parentId: user.parentId,
           accountLocked: user.accountLocked,
           forcePasswordReset: user.forcePasswordReset,
           emailVerified: user.emailVerified,
@@ -278,6 +322,10 @@ router.post('/register', async (req, res) => {
         email: user.email,
         name: user.name,
         emailVerified: user.emailVerified,
+        role: user.role,
+        parentId: user.parentId,
+        accountOwnerId: user.parentId || user.id,
+        permissions: user.permissions,
       },
     });
   } catch (error) {
@@ -334,16 +382,11 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    if (user.accountLocked) {
-      return res.status(403).json({ error: 'Account locked by admin' });
-    }
+    const { owner } = await resolveAccountOwner(user);
+    const statusError = evaluateAccountStatus(user, owner);
 
-    if (!user.emailVerified) {
-      return res.status(403).json({ error: 'Email not verified' });
-    }
-
-    if (user.forcePasswordReset) {
-      return res.status(403).json({ error: 'Password reset required', mustReset: true });
+    if (statusError) {
+      return res.status(statusError.status).json(statusError.body);
     }
 
     if (user.mfaEnabled) {
@@ -359,6 +402,10 @@ router.post('/login', async (req, res) => {
         id: user.id,
         email: user.email,
         name: user.name,
+        role: user.role,
+        parentId: user.parentId,
+        accountOwnerId: owner?.id || user.id,
+        permissions: user.permissions,
       },
     });
   } catch (error) {
@@ -391,16 +438,11 @@ router.post('/mfa/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    if (user.accountLocked) {
-      return res.status(403).json({ error: 'Account locked by admin' });
-    }
+    const { owner } = await resolveAccountOwner(user);
+    const statusError = evaluateAccountStatus(user, owner);
 
-    if (!user.emailVerified) {
-      return res.status(403).json({ error: 'Email not verified' });
-    }
-
-    if (user.forcePasswordReset) {
-      return res.status(403).json({ error: 'Password reset required', mustReset: true });
+    if (statusError) {
+      return res.status(statusError.status).json(statusError.body);
     }
 
     const verified = speakeasy.totp.verify({
@@ -423,6 +465,10 @@ router.post('/mfa/login', async (req, res) => {
         id: user.id,
         email: user.email,
         name: user.name,
+        role: user.role,
+        parentId: user.parentId,
+        accountOwnerId: owner?.id || user.id,
+        permissions: user.permissions,
       },
     });
   } catch (error) {
@@ -491,16 +537,11 @@ router.post('/refresh', async (req, res) => {
       return res.status(401).json({ error: 'Invalid refresh token' });
     }
 
-    if (user.accountLocked) {
-      return res.status(403).json({ error: 'Account locked by admin' });
-    }
+    const { owner } = await resolveAccountOwner(user);
+    const statusError = evaluateAccountStatus(user, owner);
 
-    if (!user.emailVerified) {
-      return res.status(403).json({ error: 'Email not verified' });
-    }
-
-    if (user.forcePasswordReset) {
-      return res.status(403).json({ error: 'Password reset required', mustReset: true });
+    if (statusError) {
+      return res.status(statusError.status).json(statusError.body);
     }
 
     const sessionContext = getClientContext(req);
@@ -627,6 +668,10 @@ router.get('/me', authenticateToken, async (req, res) => {
       id: user.id,
       email: user.email,
       name: user.name,
+      role: user.role,
+      parentId: user.parentId,
+      accountOwnerId: user.parentId || user.id,
+      permissions: user.permissions,
     });
   } catch (error) {
     console.error('Profile fetch error:', error);
@@ -646,17 +691,22 @@ router.get(
   passport.authenticate('google', { session: false, failureRedirect: '/api/auth/google/failure' }),
   async (req, res) => {
     try {
-      if (req.user.accountLocked) {
-        return res.status(403).json({ error: 'Account locked by admin' });
+      const dbUser = await prisma.user.findUnique({ where: { id: req.user.id } });
+
+      if (!dbUser) {
+        return res.status(404).json({ error: 'User not found' });
       }
 
-      if (req.user.forcePasswordReset) {
-        return res.status(403).json({ error: 'Password reset required', mustReset: true });
+      const { owner } = await resolveAccountOwner(dbUser);
+      const statusError = evaluateAccountStatus(dbUser, owner);
+
+      if (statusError) {
+        return res.status(statusError.status).json(statusError.body);
       }
 
       const sessionContext = getClientContext(req);
-      const accessToken = createAccessToken(req.user);
-      const { token: refreshToken } = await createRefreshToken(req.user.id, sessionContext);
+      const accessToken = createAccessToken(dbUser);
+      const { token: refreshToken } = await createRefreshToken(dbUser.id, sessionContext);
 
       const redirectUrl = `${frontendBaseUrl}/auth/callback?accessToken=${encodeURIComponent(
         accessToken
