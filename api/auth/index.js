@@ -176,6 +176,10 @@ router.post('/reset-password', async (req, res) => {
   }
 });
 
+router.post('/logout', authenticateToken, (req, res) => {
+  return res.json({ message: 'Logged out successfully.' });
+});
+
 router.get('/me', authenticateToken, async (req, res) => {
   try {
     const user = await prisma.user.findUnique({ where: { id: req.user.id } });
