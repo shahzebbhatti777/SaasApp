@@ -12,6 +12,8 @@ model User {
   email     String   @unique
   password  String
   name      String
+  accountLocked      Boolean   @default(false)
+  forcePasswordReset Boolean   @default(false)
   emailVerified Boolean @default(false)
   mfaEnabled Boolean  @default(false)
   mfaSecret  String?
@@ -21,6 +23,8 @@ model User {
   refreshes RefreshToken[]
   sessions  SessionLog[]
   emailVerifications EmailVerificationToken[]
+  adminAuditLogs  AuditLog[] @relation("AdminActor")
+  userAuditLogs   AuditLog[] @relation("UserSubject")
 }
 
 model PasswordReset {
@@ -62,5 +66,16 @@ model EmailVerificationToken {
   userId    String
   user      User     @relation(fields: [userId], references: [id])
   expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  adminId   String
+  admin     User     @relation("AdminActor", fields: [adminId], references: [id])
+  userId    String
+  user      User     @relation("UserSubject", fields: [userId], references: [id])
+  action    String
+  reason    String?
   createdAt DateTime @default(now())
 }

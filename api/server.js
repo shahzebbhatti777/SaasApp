@@ -6,6 +6,7 @@ const passport = require('passport');
 dotenv.config();
 
 const authRoutes = require('./auth');
+const adminRoutes = require('./admin');
 
 const app = express();
 
@@ -14,6 +15,7 @@ app.use(express.json());
 app.use(passport.initialize());
 
 app.use('/api/auth', authRoutes);
+app.use('/api/admin', adminRoutes);
 
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });

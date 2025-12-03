@@ -231,6 +231,9 @@ passport.use(
           id: user.id,
           email: user.email,
           name: user.name,
+          accountLocked: user.accountLocked,
+          forcePasswordReset: user.forcePasswordReset,
+          emailVerified: user.emailVerified,
         });
       } catch (error) {
         console.error('Google authentication error:', error);
@@ -331,8 +334,16 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
+    if (user.accountLocked) {
+      return res.status(403).json({ error: 'Account locked by admin' });
+    }
+
     if (!user.emailVerified) {
       return res.status(403).json({ error: 'Email not verified' });
+    }
+
+    if (user.forcePasswordReset) {
+      return res.status(403).json({ error: 'Password reset required', mustReset: true });
     }
 
     if (user.mfaEnabled) {
@@ -380,8 +391,16 @@ router.post('/mfa/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
+    if (user.accountLocked) {
+      return res.status(403).json({ error: 'Account locked by admin' });
+    }
+
     if (!user.emailVerified) {
       return res.status(403).json({ error: 'Email not verified' });
+    }
+
+    if (user.forcePasswordReset) {
+      return res.status(403).json({ error: 'Password reset required', mustReset: true });
     }
 
     const verified = speakeasy.totp.verify({
@@ -434,7 +453,7 @@ router.post('/reset-password', async (req, res) => {
 
     await prisma.user.update({
       where: { id: resetRequest.userId },
-      data: { password: hashedPassword },
+      data: { password: hashedPassword, forcePasswordReset: false },
     });
 
     await prisma.passwordReset.delete({ where: { id: resetRequest.id } });
@@ -472,8 +491,16 @@ router.post('/refresh', async (req, res) => {
       return res.status(401).json({ error: 'Invalid refresh token' });
     }
 
+    if (user.accountLocked) {
+      return res.status(403).json({ error: 'Account locked by admin' });
+    }
+
     if (!user.emailVerified) {
       return res.status(403).json({ error: 'Email not verified' });
+    }
+
+    if (user.forcePasswordReset) {
+      return res.status(403).json({ error: 'Password reset required', mustReset: true });
     }
 
     const sessionContext = getClientContext(req);
@@ -619,6 +646,14 @@ router.get(
   passport.authenticate('google', { session: false, failureRedirect: '/api/auth/google/failure' }),
   async (req, res) => {
     try {
+      if (req.user.accountLocked) {
+        return res.status(403).json({ error: 'Account locked by admin' });
+      }
+
+      if (req.user.forcePasswordReset) {
+        return res.status(403).json({ error: 'Password reset required', mustReset: true });
+      }
+
       const sessionContext = getClientContext(req);
       const accessToken = createAccessToken(req.user);
       const { token: refreshToken } = await createRefreshToken(req.user.id, sessionContext);
