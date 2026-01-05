@@ -1,0 +1,92 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DB_URL")
+}
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  password  String
+  provider  String?
+  providerId String?
+  avatar    String?
+  name      String
+  parentId  String?
+  parent    User?    @relation("SubAccounts", fields: [parentId], references: [id])
+  subAccounts User[] @relation("SubAccounts")
+  role      String   @default("user")
+  permissions String[] @default([])
+  accountLocked      Boolean   @default(false)
+  forcePasswordReset Boolean   @default(false)
+  emailVerified Boolean @default(false)
+  mfaEnabled Boolean  @default(false)
+  mfaSecret  String?
+  lastMfaVerifiedAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  resets    PasswordReset[]
+  refreshes RefreshToken[]
+  sessions  SessionLog[]
+  emailVerifications EmailVerificationToken[]
+  adminAuditLogs  AuditLog[] @relation("AdminActor")
+  userAuditLogs   AuditLog[] @relation("UserSubject")
+
+  @@unique([provider, providerId])
+}
+
+model PasswordReset {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  revoked   Boolean  @default(false)
+}
+
+model SessionLog {
+  id           String   @id @default(uuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id])
+  refreshToken String
+  userAgent    String
+  ipAddress    String
+  deviceId     String
+  location     String?
+  createdAt    DateTime @default(now())
+  expiresAt    DateTime
+  revoked      Boolean  @default(false)
+}
+
+model EmailVerificationToken {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  adminId   String
+  admin     User     @relation("AdminActor", fields: [adminId], references: [id])
+  userId    String
+  user      User     @relation("UserSubject", fields: [userId], references: [id])
+  action    String
+  reason    String?
+  createdAt DateTime @default(now())
+}
